@@ -27,7 +27,7 @@ Status: implemented on branch `feat/local-mode`. The first half of this file is 
 cp .env.local-mode.example .env.local
 ```
 
-Replace `change-me` with a long random string, for example the output of `openssl rand -hex 24`. Next.js reads `.env.local` for `dev`, `build` and `start`, so this replaces a cloud `.env.local` if you have one. Local mode needs no 1Password and no `make` targets.
+Replace `change-me` with a long random string, for example the output of `openssl rand -hex 24`. The server accepts `change-me` like any other token. Next.js reads `.env.local` for `dev`, `build` and `start`, so this replaces a cloud `.env.local` if you have one. Local mode needs no 1Password and no `make` targets.
 
 | Variable                      | Default                             | Meaning                                                                                                     |
 | ----------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -51,6 +51,8 @@ bun run dev -H 127.0.0.1
 For a production build, run `bun run build && bun run start -H 127.0.0.1` instead. The MCP endpoint is `http://127.0.0.1:3002/mcp`.
 
 Keep `-H 127.0.0.1`. Next.js listens on `0.0.0.0` by default, and a valid token is root on this host. Browsers run as `--privileged` containers, and `exec_command` runs as root inside them. Use an [SSH tunnel](#remote-use-over-ssh) for remote access.
+
+Use a single-user host. Each browser also publishes its kernel-images API, which has no auth and runs commands as root, and its CDP port on `127.0.0.1`. Any local user can reach them without a token and get root on the host.
 
 ### 4. Connect your agent
 
@@ -129,7 +131,7 @@ The server saves a profile only when a browser created with save changes on goes
 
 To change a saved profile, run setup again with `update_existing: true`. If a save fails, the server keeps the browser and the delete returns an error, so run the delete again. When two browsers save the same profile, the last one wins.
 
-When the server stops, its browsers keep running and nothing is saved. A restarted server reaps them after their timeout and saves them then. Removing them by hand with `docker rm -f` drops unsaved changes.
+When the server stops, its browsers keep running and nothing is saved. A restarted server reaps them after their timeout and saves them then. After a Docker or host restart, the server starts its stopped browsers again on its next request and reaps them the same way. Removing them by hand with `docker rm -f` drops unsaved changes.
 
 ### Idle timeout and limits
 
@@ -190,7 +192,7 @@ Every feature that behaves differently from the cloud costs more than it brings,
 | `replay_view_url`, recordings after delete                                                                                                                     | Recordings are files inside the container.                                                                                                                                                                                        |
 | `local_forward`, `remote_forward` on `manage_browsers create`                                                                                                  | They print a cloud `kernel browsers ssh` command. Use `host.docker.internal` instead.                                                                                                                                             |
 | macOS, Docker Desktop, arm64, Unikraft                                                                                                                         | The image is Linux x86_64, and host networking was only verified on Linux with Docker Engine.                                                                                                                                     |
-| Isolation between developers, TLS, reverse proxy                                                                                                               | Personal use first. Tokens separate browsers, but profiles, the browser cap and the host are shared.                                                                                                                              |
+| Isolation between developers, TLS, reverse proxy                                                                                                               | Personal use on a single-user host. Tokens separate browsers, but profiles, the browser cap and the host are shared.                                                                                                              |
 
 ## Spec
 
