@@ -423,6 +423,21 @@ describe("local browsers", () => {
     expect(removed()).toEqual([]);
   });
 
+  test("list honors status, query, tags, offset and limit", async () => {
+    await client().browsers.create({ name: "alpha" });
+    await client().browsers.create({ name: "beta" });
+    const names = async (query: Parameters<Kernel["browsers"]["list"]>[0]) =>
+      (await client().browsers.list(query))
+        .getPaginatedItems()
+        .map((b) => b.name);
+    expect(await names({ status: "deleted" })).toEqual([]);
+    expect(await names({ tags: { team: "x" } })).toEqual([]);
+    expect(await names({ query: "LPH" })).toEqual(["alpha"]);
+    expect(await names({ status: "all" })).toHaveLength(2);
+    expect(await names({ offset: 1 })).toHaveLength(1);
+    expect(await names({ limit: 1 })).toHaveLength(1);
+  });
+
   test("forwards per-browser calls with the prefix stripped", async () => {
     const { session_id } = await client().browsers.create({});
     const result = await client().browsers.process.exec(session_id, {

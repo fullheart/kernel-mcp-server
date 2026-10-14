@@ -38,6 +38,16 @@ const json = (body: unknown, status = 200) =>
   Response.json(body, { status, headers: { "x-should-retry": "false" } });
 const noContent = () => new Response(null, { status: 204 });
 
+// One page with no pagination headers, so has_more stays unknown.
+const page = <T>(items: T[], params: URLSearchParams) => {
+  const offset = Number(params.get("offset") ?? 0);
+  const limit = params.get("limit");
+  return items.slice(
+    offset,
+    limit === null ? undefined : offset + Number(limit),
+  );
+};
+
 async function readJson(request: Request) {
   const text = await request.text();
   return text ? JSON.parse(text) : {};
@@ -155,12 +165,11 @@ async function route(
   // Profiles are shared by all tokens. Lists are one bare page.
   if (parts[0] === "profiles" && parts.length === 1) {
     if (method === "GET") {
-      return json(
-        await listProfiles({
-          name: url.searchParams.get("name") ?? undefined,
-          query: url.searchParams.get("query") ?? undefined,
-        }),
-      );
+      const profiles = await listProfiles({
+        name: url.searchParams.get("name") ?? undefined,
+        query: url.searchParams.get("query") ?? undefined,
+      });
+      return json(page(profiles, url.searchParams));
     }
     if (method === "POST") {
       return json(await createProfile((await readJson(request)).name));
@@ -179,7 +188,24 @@ async function route(
 
   if (parts[0] !== "browsers") return null;
   if (parts.length === 1) {
-    if (method === "GET") return json(await listBrowsers(rt, owner));
+    if (method === "GET") {
+      const params = url.searchParams;
+      const query = params.get("query")?.toLowerCase();
+      // Delete removes the container and create rejects tags, so neither
+      // filter can match a local browser.
+      const none =
+        params.get("status") === "deleted" ||
+        [...params.keys()].some((key) => key.startsWith("tags"));
+      const browsers = none ? [] : await listBrowsers(rt, owner);
+      const matches = browsers.filter(
+        (b) =>
+          !query ||
+          [b.session_id, b.name, b.profile?.id, b.profile?.name].some((v) =>
+            v?.toLowerCase().includes(query),
+          ),
+      );
+      return json(page(matches, params));
+    }
     if (method === "POST") {
       return json(
         await createBrowser(rt, owner, await readJson(request), signal),
