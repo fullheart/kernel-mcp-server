@@ -4,7 +4,7 @@ Run this MCP server against self-hosted [kernel-images](https://github.com/kerne
 
 Goal: a coding agent (T3 Code, Claude Code, Cursor) tests web apps in a real browser through this server, the kernel.sh use case, fully offline and without the T3 Code built-in browser. Keep it straightforward. Every feature that needs explaining or behaves differently from the cloud costs more than it brings.
 
-Status: spec v2, not implemented. Branch `feat/local-mode`. v2 replaces guesses from v1 with facts verified against kernel-images source, the `@onkernel/sdk` 0.121.0 source, the kernel.sh docs and probes against `onkernel/chromium-headful:c1128b7`. Evidence lives in `.cache/facts/` (gitignored, local only).
+Status: spec v2, implemented on branch `feat/local-mode`. The how-to rewrite (acceptance item 5) is still open. v2 replaces guesses from v1 with facts verified against kernel-images source, the `@onkernel/sdk` 0.121.0 source, the kernel.sh docs and probes against `onkernel/chromium-headful:c1128b7`. Evidence lives in `.cache/facts/` (gitignored, local only).
 
 ## How kernel-images works (verified)
 
@@ -51,7 +51,7 @@ KERNEL_LOCAL_PUBLIC_HOST=localhost
 KERNEL_LOCAL_MAX_BROWSERS=5
 ```
 
-`KERNEL_PROJECT` must stay unset (or `local`). Anything that cloud mode needs at import time (`CLERK_SECRET_KEY` for HMAC, Clerk publishable key in `src/proxy.ts`) must either get a local fallback or be skipped in local mode, so the env block above is all a user sets. Verify with `next dev` and `next start`.
+`KERNEL_PROJECT` must stay unset (or `local`). Anything that cloud mode needs at import time (`CLERK_SECRET_KEY` for HMAC, Clerk publishable key in `src/proxy.ts`, the `KERNEL_CLI_*_CLIENT_ID` checks in `src/lib/const.ts` that `next build` hits) must either get a local fallback or be skipped in local mode, so the env block above is all a user sets. Verify with `next dev` and `next start`.
 
 ## Request flow in local mode
 
@@ -73,6 +73,8 @@ SDK contract (verified in SDK source):
 - List endpoints return a bare JSON array with no pagination headers (one page).
 - Decode the path id with `decodeURIComponent`.
 - Honor `init.signal`: if a create is aborted after `docker run`, remove the container.
+
+Run one MCP process per Docker host. The activity map, the create lock and the reaper are per process, so a second process reaps the first one's busy browsers once their timeout passes.
 
 Routing:
 
@@ -104,11 +106,12 @@ docker run -d --pull never --privileged --tmpfs /dev/shm:size=2g --memory 8192m
   <KERNEL_LOCAL_IMAGE>
 ```
 
-Read the host ports back with `docker port`. After ready, `POST /configure` with:
+Read the host ports and labels back with one `docker ps --format` call per lookup. One parser then serves list, get and port lookup, and names with commas stay safe. After ready, `POST /configure` with:
 
 - `display`: the requested viewport, else the cloud default 1920x1080@25. When `refresh_rate` is omitted, use the highest rate xorg.conf lists for that size. Sizes not listed: 400 with the list of supported sizes. Read the mode list from the image's xorg.conf via `/fs/read_file` (path from the facts), cached per image.
 - `chromium_flags`: `--kiosk` when `kiosk_mode`.
 - `profile_archive`: the stored archive when a profile with data is requested.
+- `chrome_policies`: the `chrome_policy` create param, when given.
 - `start_url` when given.
 
 If anything after `docker run` fails, remove the container and return the error.
@@ -120,14 +123,15 @@ Fields: `session_id`, `name`, `created_at`, `timeout_seconds`, `cdp_ws_url`, `vi
 ### Create params
 
 - No local effect, accepted and reflected truthfully in the response: `stealth` (always false), `headless` (always false), `gpu`, `region`, `memory`, `telemetry`, `invocation_id`.
-- Need cloud resources, 400 with a clear message: `proxy_id`, `extensions`, `vaults`, `pool`, `network`.
-- `name` must be unique per owner (409).
+- Need cloud resources, 400 with a clear message: `proxy_id`, `extensions`, `vaults`, `pool`, `network`. Any key outside the accepted list (`name`, `timeout_seconds`, `viewport`, `kiosk_mode`, `profile`, `start_url`, `chrome_policy` plus the no-effect ones above) gets the same 400, `tags` and `proxy` included.
+- `name` must be unique per owner (409). Over `KERNEL_LOCAL_MAX_BROWSERS`: 429.
 
 ### Replays
 
 - `start`: generate a UUID, `POST /recording/start {"id": uuid}` (plus mapped options), return `{replay_id}`.
 - `stop`: `POST /recording/stop {"id"}`, return 204.
 - `list`: `GET /recording/list`, map `{id, started_at, finished_at}` to `{replay_id, started_at, finished_at}`.
+- `download` (`GET /browsers/{id}/replays/{replay_id}`): `GET /recording/download?id=`.
 - No `replay_view_url`. Recordings live in the container under `/recordings/<id>.mp4` and disappear with it. Document that `manage_browser_files` can read the file while the browser exists.
 
 ### Profiles
@@ -135,7 +139,7 @@ Fields: `session_id`, `name`, `created_at`, `timeout_seconds`, `cdp_ws_url`, `vi
 Store under `$KERNEL_LOCAL_DATA_DIR/profiles/`: `<id>.json` (`{id, name, created_at, updated_at, last_used_at}`) and `<id>.tar.zst` once saved. Ids are 24 random lowercase hex chars. Names are unique, matched case-insensitively (409 on duplicate). `create`, `list`, `retrieve` (id or name), `update` (rename), `delete` follow the SDK shapes.
 
 - Load: `POST /configure` with `profile_archive` = the `.tar.zst` file. A profile without an archive starts empty.
-- Save (delete or idle reap with `save_changes`): CDP `Browser.close` on `ws://127.0.0.1:<cdp port>/` (Node 24 global `WebSocket`), then `/process/exec` `supervisorctl -c /etc/supervisor/supervisord.conf stop chromium`, then `GET /fs/download_dir_zstd?path=/home/kernel/user-data`, written atomically (temp file plus rename). Then remove the container.
+- Save (delete or idle reap with `save_changes`): CDP `Browser.close` on `ws://127.0.0.1:<cdp port>/` (Node 24 global `WebSocket`), then `/process/exec` `supervisorctl -c /etc/supervisor/supervisord.conf stop chromium`, then `GET /fs/download_dir_zstd?path=/home/kernel/user-data`, written atomically (temp file plus rename). Then remove the container. If the download fails, the container stays and delete returns 500, so the profile data is not lost.
 - Last writer wins, no locking, same as the cloud.
 
 ## Tests and acceptance
