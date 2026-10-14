@@ -622,13 +622,13 @@ export function throwVaultError(
   action: string,
   error: unknown,
   operationSubmitted = false,
-  operation?: string,
 ): never {
-  const guidance =
-    operationSubmitted && operation === "fill"
-      ? "fill may have written some fields but never submits the form, so it is safe to retry after fixing any reported cause."
-      : operationSubmitted
-        ? "the operation may have partially completed. inspect item state, events, and browser before acting. do not retry automatically."
-        : "inspect item state/events before taking further action. do not replay a payment.";
-  throwToolError(tool, action, error, guidance);
+  const noResponse =
+    error instanceof APIError && typeof error.status !== "number";
+  const note = noResponse
+    ? operationSubmitted
+      ? "no response was received from the api after the operation was submitted."
+      : "no response was received from the api."
+    : undefined;
+  throwToolError(tool, action, error, note);
 }

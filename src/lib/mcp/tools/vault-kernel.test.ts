@@ -689,6 +689,14 @@ describe("kernel-managed payment tools", () => {
           operation,
           vault: "checkout",
           key: "order-1",
+          ...(operation === "fill"
+            ? {
+                inputs: {
+                  browser_id: "browser-1",
+                  fields: [{ field: "number", selector: "#number" }],
+                },
+              }
+            : {}),
         });
         const text = JSON.stringify(result);
         expect(result.isError).toBe(true);
