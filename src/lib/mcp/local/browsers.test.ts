@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   createBrowser,
+  listBrowsers,
   reapIdle,
   removeBrowser,
   trackCall,
@@ -115,5 +116,64 @@ describe("local browser lifecycle", () => {
     controller.abort();
     await expect(create).rejects.toThrow();
     expect(calls.some((c) => c[0] === "run")).toBe(false);
+  });
+
+  test("a browser restarted by Docker gets its last viewport back", async () => {
+    const patched: unknown[] = [];
+    const api = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/fs/read_file") {
+          return new Response(
+            'Modeline "1280x720_30.00"\nModeline "1280x720_60.00"\nModeline "1024x768_60.00"',
+          );
+        }
+        if (req.method === "PATCH") patched.push(await req.json());
+        return new Response("ok");
+      },
+    });
+    const state: Record<string, string> = { r1: "exited", r2: "exited" };
+    const { rt } = runtime(async (args) => {
+      if (args[0] === "start") state[args[1]] = "running";
+      if (args[0] !== "ps") return "";
+      return Object.entries(state)
+        .map(([id, s]) =>
+          JSON.stringify({
+            containerId: id,
+            state: s,
+            image: "restore-img",
+            ports: s === "running" ? `127.0.0.1:${api.port}->10001/tcp` : "",
+            id,
+            owner: "alice",
+            timeout: "60",
+            viewport: "1280x720",
+          }),
+        )
+        .join("\n");
+    });
+    // r1 was updated after create; r2 only has its label, without a rate.
+    rt.viewports.set("r1", { width: 1024, height: 768, refresh_rate: 60 });
+    // next dev tees GET bodies and keeps one branch unread, so cancelling
+    // the other never settles.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const response = await realFetch(input, init);
+      if (init?.method || !response.body) return response;
+      const [, branch] = response.body.tee();
+      return new Response(branch, response);
+    }) as typeof fetch;
+    const browsers = await listBrowsers(rt, "alice").finally(() => {
+      globalThis.fetch = realFetch;
+      api.stop();
+    });
+    const r1 = { width: 1024, height: 768, refresh_rate: 60 };
+    const r2 = { width: 1280, height: 720, refresh_rate: 60 };
+    expect(patched).toHaveLength(2);
+    expect(patched).toEqual(expect.arrayContaining([r1, r2]));
+    expect(browsers.map((b) => b.viewport)).toEqual([r1, r2]);
   });
 });

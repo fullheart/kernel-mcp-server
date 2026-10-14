@@ -64,8 +64,20 @@ type Row = LocalContainer & { state: string };
 // that another pass has already started.
 let restarting: Promise<void> = Promise.resolve();
 
+// Ids that did not come back after a start: the start failed, the container
+// exited again, or its API never answered. Starting them on every call would
+// cost every call a start and a 30 s wait.
+// ponytail: remembered until the server restarts, even after a one-off
+// failure. Restart the server or `docker rm -f` the container to clear it.
+const failed = new Set<string>();
+
+// Runs on a browser started again after a Docker restart. It waits for the
+// API and throws only when the API never answers.
+export type Restore = (container: LocalContainer) => Promise<void>;
+
 export async function listContainers(
   docker: DockerRunner,
+  restore: Restore,
   ...labels: string[]
 ): Promise<LocalContainer[]> {
   const filters = ["kernel.local=1", ...labels].flatMap((label) => [
@@ -100,10 +112,14 @@ export async function listContainers(
         };
       });
   };
+  // A pass marks browsers running before their API is back, so wait for it.
+  await restarting;
   let rows = await list();
-  if (rows.some((row) => row.state === "exited")) {
+  if (
+    rows.some((row) => row.state === "exited" && !failed.has(row.containerId))
+  ) {
     restarting = restarting
-      .then(() => startExited(docker, list))
+      .then(() => startExited(docker, list, restore))
       .catch((error) =>
         console.error("Failed to start stopped local browsers", error),
       );
@@ -119,10 +135,14 @@ export async function listContainers(
 // A Docker or host restart leaves browsers exited. Starting them again
 // makes them behave like browsers of a restarted server: the reaper saves
 // and removes them after their timeout.
-// ponytail: a container that dies on every start is started again on every
-// call. Remember failed ids if that ever happens.
-async function startExited(docker: DockerRunner, list: () => Promise<Row[]>) {
-  const exited = (await list()).filter((row) => row.state === "exited");
+async function startExited(
+  docker: DockerRunner,
+  list: () => Promise<Row[]>,
+  restore: Restore,
+) {
+  const exited = (await list()).filter(
+    (row) => row.state === "exited" && !failed.has(row.containerId),
+  );
   if (!exited.length) return;
   // The image's wrapper waits for supervisord's socket file. The file left
   // by the last run is there at once, so the wrapper calls supervisorctl
@@ -146,7 +166,11 @@ async function startExited(docker: DockerRunner, list: () => Promise<Row[]>) {
           await docker(["start", containerId]);
           started.add(containerId);
         } catch (error) {
-          console.error("Failed to start stopped local browser", error);
+          failed.add(containerId);
+          console.error(
+            `Failed to start stopped local browser ${containerId}`,
+            error,
+          );
         }
       }),
     );
@@ -154,44 +178,21 @@ async function startExited(docker: DockerRunner, list: () => Promise<Row[]>) {
     await rm(dir, { recursive: true, force: true });
   }
   // The ports change on start, so list again.
-  const rows = (await list()).filter((row) => started.has(row.containerId));
+  const rows = await list();
   await Promise.all(
-    rows.map((row) =>
-      restoreViewport(row).catch((error) =>
-        console.error("Failed to restore local browser viewport", error),
-      ),
-    ),
+    [...started].map(async (id) => {
+      try {
+        const row = rows.find((row) => row.containerId === id);
+        if (row?.state !== "running" || !Number.isFinite(row.apiPort)) {
+          throw new Error("exited again after start");
+        }
+        await restore(row);
+      } catch (error) {
+        failed.add(id);
+        console.error(`Failed to start stopped local browser ${id}`, error);
+      }
+    }),
   );
-}
-
-// Xorg comes back at its 3840x2160 boot mode, so the labeled viewport is set
-// again. Retrying until the API answers also keeps the browser out of use
-// until it is ready.
-async function restoreViewport(container: LocalContainer) {
-  const [, width, height, rate] =
-    container.labels.viewport.match(/^(\d+)x(\d+)(?:@(\d+))?$/) ?? [];
-  const body = JSON.stringify({
-    width: Number(width),
-    height: Number(height),
-    ...(rate && { refresh_rate: Number(rate) }),
-  });
-  const deadline = Date.now() + 30_000;
-  for (;;) {
-    const response = await fetch(`${apiBase(container)}/display`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body,
-    }).catch(() => null);
-    if (response) {
-      if (!response.ok) throw new Error(await errorText(response));
-      await response.body?.cancel();
-      return;
-    }
-    if (Date.now() > deadline) {
-      throw new Error("browser did not become ready within 30s");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
 }
 
 export const apiBase = (container: LocalContainer) =>

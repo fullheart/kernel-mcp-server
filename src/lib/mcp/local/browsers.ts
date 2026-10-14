@@ -160,11 +160,39 @@ export async function toBrowser(
   };
 }
 
+// A Docker restart brings Xorg back at its 3840x2160 boot mode, so a
+// restarted browser gets its last viewport again, else the labeled one.
+async function restore(rt: LocalRuntime, container: LocalContainer) {
+  // Every listing waits for this, so no fetch here may hang.
+  const signal = AbortSignal.timeout(60_000);
+  await waitReady(container, signal);
+  try {
+    const viewport = resolveViewport(
+      await modesFor(rt, container),
+      rt.viewports.get(container.labels.id) ??
+        parseViewport(container.labels.viewport) ??
+        DEFAULT_VIEWPORT,
+    );
+    const response = await fetch(`${apiBase(container)}/display`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(viewport),
+      signal,
+    });
+    if (!response.ok) throw new Error(await errorText(response));
+    response.body?.cancel().catch(() => {});
+    rt.viewports.set(container.labels.id, viewport);
+  } catch (error) {
+    // The browser is back; only its viewport is wrong.
+    console.error("Failed to restore local browser viewport", error);
+  }
+}
+
+const list = (rt: LocalRuntime, ...labels: string[]) =>
+  listContainers(rt.docker, (container) => restore(rt, container), ...labels);
+
 export async function listBrowsers(rt: LocalRuntime, owner: string) {
-  const containers = await listContainers(
-    rt.docker,
-    `kernel.local.owner=${owner}`,
-  );
+  const containers = await list(rt, `kernel.local.owner=${owner}`);
   return Promise.all(containers.map((container) => toBrowser(rt, container)));
 }
 
@@ -173,10 +201,7 @@ export async function findBrowser(
   owner: string,
   idOrName: string,
 ) {
-  const containers = await listContainers(
-    rt.docker,
-    `kernel.local.owner=${owner}`,
-  );
+  const containers = await list(rt, `kernel.local.owner=${owner}`);
   const container =
     containers.find((c) => c.labels.id === idOrName) ??
     containers.find((c) => c.labels.name === idOrName);
@@ -201,7 +226,9 @@ async function waitReady(container: LocalContainer, signal?: AbortSignal) {
     const response = await fetch(`${apiBase(container)}/spec.yaml`, {
       signal,
     }).catch(() => null);
-    await response?.body?.cancel();
+    // Not awaited: next dev tees GET bodies for its cache, and cancelling one
+    // branch can wait forever for the other.
+    response?.body?.cancel().catch(() => {});
     if (response?.ok) return;
     if (Date.now() > deadline) {
       throw new Error("browser container did not become ready within 30s");
@@ -260,7 +287,7 @@ export async function createBrowser(
   else await reapIdle(rt);
   signal?.throwIfAborted();
   const containerId = await withLock(rt, async () => {
-    const running = await listContainers(rt.docker);
+    const running = await list(rt);
     const max = Number(process.env.KERNEL_LOCAL_MAX_BROWSERS) || 5;
     if (running.length >= max) {
       throw new LocalError(
@@ -330,10 +357,7 @@ export async function createBrowser(
 
   try {
     signal?.throwIfAborted();
-    const [container] = await listContainers(
-      rt.docker,
-      `kernel.local.id=${id}`,
-    );
+    const [container] = await list(rt, `kernel.local.id=${id}`);
     if (!container) throw new Error("browser container exited during start");
     await waitReady(container, signal);
     const viewport = resolveViewport(await modesFor(rt, container), requested);
@@ -482,7 +506,7 @@ export function reapIdle(rt: LocalRuntime) {
   rt.reaping ??= (async () => {
     try {
       const now = rt.now();
-      for (const container of await listContainers(rt.docker)) {
+      for (const container of await list(rt)) {
         const id = container.labels.id;
         if (rt.busy?.get(id)) continue;
         if (!rt.activity.has(id)) rt.activity.set(id, now);
