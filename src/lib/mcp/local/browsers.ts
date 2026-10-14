@@ -426,8 +426,9 @@ export function removeBrowser(rt: LocalRuntime, container: LocalContainer) {
   return removal;
 }
 
-// Wraps a call on a browser: the reaper skips the browser until the call,
-// including a streamed response body, is done. Idle time restarts then.
+// Wraps a call on a browser: the reaper skips the browser until the response
+// arrives. Reading its body then counts as activity, so a body nobody reads
+// or cancels only lets the browser go idle instead of keeping it forever.
 export async function trackCall<T extends Response | null>(
   rt: LocalRuntime,
   id: string,
@@ -435,44 +436,36 @@ export async function trackCall<T extends Response | null>(
 ): Promise<T> {
   const busy = (rt.busy ??= new Map<string, number>());
   busy.set(id, (busy.get(id) ?? 0) + 1);
-  let done = false;
-  const finish = () => {
-    if (done) return;
-    done = true;
-    const left = busy.get(id)! - 1;
-    if (left) busy.set(id, left);
-    else busy.delete(id);
-    // A delete during the call already dropped the id.
+  // A delete during the call already dropped the id.
+  const touch = () => {
     if (rt.activity.has(id)) rt.activity.set(id, rt.now());
   };
   let response: T;
   try {
     response = await call;
-  } catch (error) {
-    finish();
-    throw error;
+  } finally {
+    const left = busy.get(id)! - 1;
+    if (left) busy.set(id, left);
+    else busy.delete(id);
+    touch();
   }
-  if (!response?.body) {
-    finish();
-    return response;
-  }
+  if (!response?.body) return response;
   // Not a TransformStream: Bun never calls its cancel hook.
   const reader = response.body.getReader();
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const chunk = await reader.read();
-        if (chunk.done) {
-          finish();
-          controller.close();
-        } else controller.enqueue(chunk.value);
+        touch();
+        if (chunk.done) controller.close();
+        else controller.enqueue(chunk.value);
       } catch (error) {
-        finish();
+        touch();
         controller.error(error);
       }
     },
     cancel(reason) {
-      finish();
+      touch();
       return reader.cancel(reason);
     },
   });

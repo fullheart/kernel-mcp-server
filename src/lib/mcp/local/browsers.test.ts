@@ -46,7 +46,7 @@ const withLabels =
   };
 
 describe("local browser lifecycle", () => {
-  test("the reaper keeps a browser while a call or its stream runs", async () => {
+  test("the reaper keeps a browser while a call runs and its body is read", async () => {
     const { docker, removed } = oneBrowser();
     const { rt, tick } = runtime(withLabels(docker));
     rt.activity.set("b1", 0);
@@ -63,16 +63,15 @@ describe("local browser lifecycle", () => {
 
     let push!: ReadableStreamDefaultController<Uint8Array>;
     respond(new Response(new ReadableStream({ start: (c) => (push = c) })));
-    const response = await call;
-    tick(11_000);
-    await reapIdle(rt);
-    expect(removed()).toEqual([]);
-
-    push.close();
-    await response.arrayBuffer();
+    const reader = (await call).body!.getReader();
+    tick(9_000);
+    push.enqueue(new Uint8Array([1]));
+    await reader.read();
     tick(9_000);
     await reapIdle(rt);
     expect(removed()).toEqual([]);
+
+    // A body nobody reads or cancels no longer holds the browser.
     tick(2_000);
     await reapIdle(rt);
     expect(removed()).toEqual([["rm", "-f", "c1"]]);

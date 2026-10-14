@@ -234,7 +234,8 @@ async function route(
   if (rest.join("/") === "telemetry/events" && method === "GET") {
     return json([]);
   }
-  // The reaper skips the browser until the call and its body are done.
+  // The reaper skips the browser until the response arrives; each body read
+  // then counts as activity.
   const browserId = container.labels.id;
   if (rest[0] === "replays") {
     return trackCall(rt, browserId, replays(container, request, rest, signal));
