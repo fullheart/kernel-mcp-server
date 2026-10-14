@@ -96,6 +96,9 @@ describe("durable profile contracts", () => {
       },
     ]);
     expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain(
+      "**setup:** open https://example.test/live and sign into accounts to save.\n",
+    );
   });
 
   test("rejects ambiguous exact profile matches", async () => {
@@ -222,6 +225,33 @@ describe("durable profile contracts", () => {
       'profile "Acme" loaded for update.',
     );
     expect(result.content[0].text).toContain("profile id: profile-1");
+  });
+
+  test("tells the agent to sign in itself when there is no live view", async () => {
+    const client = {
+      profiles: {
+        list: () => profilePage([]),
+        create: async () => ({ id: "profile-new", name: "Acme" }),
+      },
+      browsers: { create: async () => ({ session_id: "session-1" }) },
+    };
+    const handler = captureTool(
+      registerProfileCapabilities,
+      "manage_profiles",
+      client,
+    );
+
+    const result = await handler(
+      { action: "setup", profile_name: "Acme" },
+      auth,
+    );
+
+    expect(result.content[0].text).toBe(
+      'profile "Acme" created.\n\n' +
+        "**setup:** profile browser session-1 is ready with save_changes. there is no live view, so sign into accounts with execute_playwright_code or computer_action.\n" +
+        '**when done:** use manage_browsers with action "delete" and session_id "session-1" to save the profile.\n\n' +
+        "profile id: profile-new | session id: session-1",
+    );
   });
 
   test("discovers and renames a profile through the MCP boundary", async () => {

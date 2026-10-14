@@ -12,6 +12,22 @@ describe("createKernelClient", () => {
       else process.env.KERNEL_LOG = previous;
     }
   });
+  test("routes to the in-process local adapter only in local mode", () => {
+    const previous = process.env.KERNEL_MODE;
+    try {
+      process.env.KERNEL_MODE = "local";
+      expect(createKernelClient("test-key").baseURL).toBe(
+        "http://kernel.local",
+      );
+      delete process.env.KERNEL_MODE;
+      expect(createKernelClient("test-key").baseURL).not.toBe(
+        "http://kernel.local",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.KERNEL_MODE;
+      else process.env.KERNEL_MODE = previous;
+    }
+  });
   test("uses an explicit project before the server default", () => {
     const previous = process.env.KERNEL_PROJECT;
     process.env.KERNEL_PROJECT = "proj_default";

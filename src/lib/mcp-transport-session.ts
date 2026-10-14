@@ -1,15 +1,22 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   decodeSessionId,
   encodeSessionId,
   newSessionId,
   type SessionTokenPayload,
 } from "@posthog/mcp";
+import { isLocalMode } from "@/lib/mcp/local/mode";
 
 const TOKEN_VERSION = "v1";
 
+// Local mode has no Clerk. Sessions carry no server state there (the marker
+// store is a no-op), so a token minted before a restart just verifies as no
+// session; a per-process secret is enough.
+const localSecret = randomBytes(32).toString("hex");
+
 function signingKey(): string {
-  const key = process.env.CLERK_SECRET_KEY;
+  const key =
+    process.env.CLERK_SECRET_KEY || (isLocalMode() ? localSecret : undefined);
   if (!key) {
     throw new Error("CLERK_SECRET_KEY environment variable must be set");
   }

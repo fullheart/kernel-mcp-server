@@ -3,6 +3,7 @@ import {
   defaultMcpDependencies,
   type McpDependencies,
 } from "@/lib/mcp/dependencies";
+import { isLocalMode, LOCAL_TOOLSETS } from "@/lib/mcp/local/mode";
 import { registerKernelPrompts } from "@/lib/mcp/prompts";
 import { registerAPIKeyCapabilities } from "@/lib/mcp/tools/api-keys";
 import { registerAppCapabilities } from "@/lib/mcp/tools/apps";
@@ -111,7 +112,9 @@ function normalizeMcpToolset(value: string): McpToolset | undefined {
 
 function enabledMcpToolsetsFromEnv() {
   const raw = process.env.KERNEL_MCP_ENABLED_TOOLSETS;
-  if (!raw?.trim()) return undefined;
+  if (!raw?.trim()) {
+    return isLocalMode() ? new Set<McpToolset>(LOCAL_TOOLSETS) : undefined;
+  }
 
   const enabled = new Set<McpToolset>();
   const unknown: string[] = [];

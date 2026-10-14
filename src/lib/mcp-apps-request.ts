@@ -12,6 +12,7 @@ import {
   hasMcpAppsClient,
   markMcpAppsClient,
 } from "@/lib/redis";
+import { isLocalMode } from "@/lib/mcp/local/mode";
 import { initializeDeclaresMcpApps } from "@/lib/mcp/tools/mcp-apps-gate";
 
 export type McpAppsMarkerStore = {
@@ -26,6 +27,14 @@ const redisMarkerStore: McpAppsMarkerStore = {
   has: hasMcpAppsClient,
 };
 
+// Local mode runs without Redis. Legacy clients then get the base tools; the
+// MCP Apps login tools need auth_connections, which local mode never enables.
+const noopMarkerStore: McpAppsMarkerStore = {
+  mark: async () => {},
+  clear: async () => {},
+  has: async () => false,
+};
+
 /**
  * Records initialize capability and selects App registration for later
  * streamable-HTTP requests. Identity is supplied only after bearer auth and
@@ -38,7 +47,9 @@ export async function requestUsesMcpApps(
     transportSessionId: string | null;
     ttlSeconds: number;
   },
-  store: McpAppsMarkerStore = redisMarkerStore,
+  store: McpAppsMarkerStore = isLocalMode()
+    ? noopMarkerStore
+    : redisMarkerStore,
 ): Promise<boolean> {
   if (req.method !== "POST") return false;
   let body: unknown;

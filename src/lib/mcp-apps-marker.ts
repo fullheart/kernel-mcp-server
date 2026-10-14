@@ -1,7 +1,13 @@
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
+import { isLocalMode } from "@/lib/mcp/local/mode";
+
+// Local mode has no Clerk. These hashes only key the no-op local marker
+// store, so a per-process secret is enough.
+const localSecret = randomBytes(32).toString("hex");
 
 function markerSecret(): string {
-  const key = process.env.CLERK_SECRET_KEY;
+  const key =
+    process.env.CLERK_SECRET_KEY || (isLocalMode() ? localSecret : undefined);
   if (!key) {
     throw new Error("CLERK_SECRET_KEY environment variable must be set");
   }
