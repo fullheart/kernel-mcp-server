@@ -131,7 +131,7 @@ The server saves a profile only when a browser created with save changes on goes
 
 To change a saved profile, run setup again with `update_existing: true`. If a save fails, the server keeps the browser and the delete returns an error, so run the delete again. When two browsers save the same profile, the last one wins.
 
-When the server stops, its browsers keep running and nothing is saved. A restarted server reaps them after their timeout and saves them then. After a Docker or host restart, the server starts its stopped browsers again on its next request and reaps them the same way. Removing them by hand with `docker rm -f` drops unsaved changes.
+When the server stops, its browsers keep running and nothing is saved. A restarted server reaps them after their timeout and saves them then. After a Docker or host restart, the server starts its stopped browsers again on its next request, which then waits a few seconds, and reaps them the same way. Removing them by hand with `docker rm -f` drops unsaved changes.
 
 ### Idle timeout and limits
 
