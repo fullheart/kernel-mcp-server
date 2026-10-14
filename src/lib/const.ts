@@ -1,12 +1,17 @@
-// Ensure these are set in the environment
-if (!process.env.KERNEL_CLI_PROD_CLIENT_ID) {
-  throw new Error("KERNEL_CLI_PROD_CLIENT_ID is not set");
-}
-if (!process.env.KERNEL_CLI_STAGING_CLIENT_ID) {
-  throw new Error("KERNEL_CLI_STAGING_CLIENT_ID is not set");
-}
-if (!process.env.KERNEL_CLI_DEV_CLIENT_ID) {
-  throw new Error("KERNEL_CLI_DEV_CLIENT_ID is not set");
+import { isLocalMode } from "@/lib/mcp/local/mode";
+
+// Ensure these are set in the environment. Local mode has no OAuth clients,
+// and next build imports this module through /authorize and /token.
+if (!isLocalMode()) {
+  if (!process.env.KERNEL_CLI_PROD_CLIENT_ID) {
+    throw new Error("KERNEL_CLI_PROD_CLIENT_ID is not set");
+  }
+  if (!process.env.KERNEL_CLI_STAGING_CLIENT_ID) {
+    throw new Error("KERNEL_CLI_STAGING_CLIENT_ID is not set");
+  }
+  if (!process.env.KERNEL_CLI_DEV_CLIENT_ID) {
+    throw new Error("KERNEL_CLI_DEV_CLIENT_ID is not set");
+  }
 }
 
 // Shared client IDs that use JWT round-trip instead of Redis for org persistence

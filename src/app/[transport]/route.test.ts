@@ -1,9 +1,19 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
 import { Kernel } from "@onkernel/sdk";
 import type { McpConnectionScopeFailureAnalytics } from "@/lib/mcp/analytics";
 import { defaultMcpDependencies } from "@/lib/mcp/dependencies";
 import { clearMcpEntitlementsCacheForTests } from "@/lib/mcp/entitlements";
+import { verifyMcpTransportSession } from "@/lib/mcp-transport-session";
 import { oauthResourceMetadata } from "@/lib/oauth-discovery";
+import { redisClient } from "@/lib/redis";
 
 process.env.CLERK_SECRET_KEY ??= "test-clerk-secret";
 
@@ -11,6 +21,11 @@ process.env.CLERK_SECRET_KEY ??= "test-clerk-secret";
 // it to flush analytics, which these tests observe directly instead.
 const nextServer = await import("next/server");
 mock.module("next/server", () => ({ ...nextServer, after: () => {} }));
+
+// Delegates, so cloud behavior is unchanged; local mode must never reach it.
+const clerk = await import("@clerk/nextjs/server");
+const verifyToken = mock(clerk.verifyToken);
+mock.module("@clerk/nextjs/server", () => ({ ...clerk, verifyToken }));
 
 // Scope resolution runs before the instrumented McpServer exists, so this
 // capture is the only record of it. Record the calls and delegate, so the
@@ -400,4 +415,125 @@ describe("connectionScopeFailureResponse", () => {
       'error="invalid_token"',
     );
   });
+});
+
+describe("local mode", () => {
+  const savedEnv: Record<string, string | undefined> = {};
+  let redisConnect: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    for (const key of ["KERNEL_MODE", "CLERK_SECRET_KEY"]) {
+      savedEnv[key] = process.env[key];
+    }
+    process.env.KERNEL_MODE = "local";
+    delete process.env.CLERK_SECRET_KEY;
+    verifyToken.mockClear();
+    // Every Redis command connects first, so this sees any Redis use.
+    redisConnect = spyOn(redisClient, "connect").mockImplementation(
+      async () => {
+        throw new Error("redis must not be used in local mode");
+      },
+    );
+    // Stands in for the local adapter: one known token, 401 for the rest.
+    defaultMcpDependencies.createKernelClient = (token) =>
+      new Kernel({
+        apiKey: token,
+        baseURL: "http://kernel.local",
+        maxRetries: 0,
+        fetch: async (input) => {
+          const path = new URL(String(input)).pathname;
+          if (token !== "dev-token")
+            return Response.json(
+              { message: "invalid local token" },
+              { status: 401 },
+            );
+          if (path === "/auth/context")
+            return Response.json({
+              authentication: {
+                method: "api_key",
+                source: "api_key",
+                credential_id: null,
+              },
+              principal: { type: "api_key", id: "me" },
+              organization: { id: "local" },
+              authorization: {
+                credential_scope: { project_id: "local" },
+                effective_scope: { project_id: "local" },
+              },
+            });
+          if (path === "/org/entitlements")
+            return Response.json({ features: {} });
+          throw new Error(`Unexpected API request: ${path}`);
+        },
+      });
+  });
+
+  afterEach(() => {
+    redisConnect.mockRestore();
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  function post(
+    token: string,
+    method: string,
+    params: object = {},
+    sessionToken?: string,
+  ) {
+    return POST(
+      new nextServer.NextRequest("http://localhost:3002/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...(sessionToken ? { "mcp-session-id": sessionToken } : {}),
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      }),
+    );
+  }
+
+  async function rpcResult(response: Response) {
+    const text = await response.text();
+    const event = text.split("\n").find((line) => line.startsWith("data: "));
+    return JSON.parse(event ? event.slice(6) : text).result;
+  }
+
+  test("serves a local token through a signed session without Clerk or Redis", async () => {
+    const initialized = await post("dev-token", "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "route-test", version: "0" },
+    });
+    expect(initialized.status).toBe(200);
+    expect((await rpcResult(initialized)).serverInfo).toBeDefined();
+    const sessionToken = initialized.headers.get("mcp-session-id");
+    expect(verifyMcpTransportSession(sessionToken)).not.toBeNull();
+
+    const listed = await post("dev-token", "tools/list", {}, sessionToken!);
+    expect(listed.status).toBe(200);
+    const names = (await rpcResult(listed)).tools.map(
+      (tool: { name: string }) => tool.name,
+    );
+    expect(names).toContain("manage_browsers");
+    expect(names).not.toContain("manage_vaults");
+    expect(verifyToken).not.toHaveBeenCalled();
+    expect(redisConnect).not.toHaveBeenCalled();
+  });
+
+  test.each(["wrong-token", "header.payload.signature"])(
+    "answers the unknown token %s with 401 invalid_token",
+    async (token) => {
+      const response = await post(token, "tools/list");
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({
+        error: "invalid_token",
+        error_description: "The Kernel API rejected this credential",
+      });
+      expect(verifyToken).not.toHaveBeenCalled();
+    },
+  );
 });

@@ -19,6 +19,7 @@ import {
   resolveMcpConnectionContext,
   type McpConnectionContextFailure,
 } from "@/lib/mcp/auth-context";
+import { isLocalMode } from "@/lib/mcp/local/mode";
 import { mcpAppsAuthSubject } from "@/lib/mcp-apps-marker";
 import { requestUsesMcpApps } from "@/lib/mcp-apps-request";
 import {
@@ -253,10 +254,12 @@ async function handleAuthenticatedRequest(
     );
   }
 
-  if (!isValidJwtFormat(token)) {
+  if (isLocalMode() || !isValidJwtFormat(token)) {
     // Opaque API keys are authenticated by the Kernel API rather than Clerk.
     // Do not cache their context: /auth/context must revalidate the credential
     // on every request so revoked keys cannot keep using a cached scope.
+    // Local mode has no Clerk: every bearer is a local token that the local
+    // adapter checks when it answers /auth/context.
     return await handleMcpRequestWithIdentity({
       req,
       token,
