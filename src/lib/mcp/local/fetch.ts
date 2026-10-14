@@ -6,6 +6,7 @@ import {
   reapIdle,
   removeBrowser,
   toBrowser,
+  trackCall,
   updateBrowser,
   type LocalRuntime,
 } from "@/lib/mcp/local/browsers";
@@ -233,15 +234,21 @@ async function route(
   if (rest.join("/") === "telemetry/events" && method === "GET") {
     return json([]);
   }
+  // The reaper skips the browser until the call and its body are done.
+  const browserId = container.labels.id;
   if (rest[0] === "replays") {
-    return replays(container, request, rest, signal);
+    return trackCall(rt, browserId, replays(container, request, rest, signal));
   }
   const prefix = `/browsers/${parts[1]}`;
-  return forward(
-    container,
-    request,
-    url.pathname.slice(prefix.length) + url.search,
-    signal,
+  return trackCall(
+    rt,
+    browserId,
+    forward(
+      container,
+      request,
+      url.pathname.slice(prefix.length) + url.search,
+      signal,
+    ),
   );
 }
 

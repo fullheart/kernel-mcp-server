@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { once } from "node:events";
 import type {
   BrowserCreateParams,
   BrowserRetrieveResponse,
@@ -48,6 +49,10 @@ export type LocalRuntime = {
   modes: Map<string, Promise<Viewport[]>>;
   lock: Promise<unknown>;
   reaping?: Promise<void>;
+  // Session id to calls still running. The reaper skips these.
+  busy?: Map<string, number>;
+  // Session id to its removal, shared by delete and the reaper.
+  removing?: Map<string, Promise<void>>;
 };
 
 const DEFAULT_IMAGE = "onkernel/chromium-headful:c1128b7";
@@ -248,7 +253,12 @@ export async function createBrowser(
     ),
   };
 
-  await reapIdle(rt);
+  // The pass can be slow (a profile save per idle browser), so the SDK's
+  // timeout or abort still ends the wait.
+  signal?.throwIfAborted();
+  if (signal) await Promise.race([reapIdle(rt), once(signal, "abort")]);
+  else await reapIdle(rt);
+  signal?.throwIfAborted();
   const containerId = await withLock(rt, async () => {
     const running = await listContainers(rt.docker);
     const max = Number(process.env.KERNEL_LOCAL_MAX_BROWSERS) || 5;
@@ -270,31 +280,51 @@ export async function createBrowser(
       process.env.TZ ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
     // Not passed the signal: killing the CLI mid-run can still leave a
     // container behind, so cleanup happens below instead.
-    const output = await rt.docker([
-      "run",
-      "-d",
-      "--pull",
-      "never",
-      "--privileged",
-      "--tmpfs",
-      "/dev/shm:size=2g",
-      "--memory",
-      "8192m",
-      "--add-host=host.docker.internal:host-gateway",
-      "-p",
-      "127.0.0.1::10001",
-      "-p",
-      "127.0.0.1::9222",
-      "-e",
-      "ENABLE_WEBRTC=false",
-      "-e",
-      `TZ=${tz}`,
-      ...Object.entries(labels).flatMap(([key, value]) => [
-        "--label",
-        `${key}=${value}`,
-      ]),
-      image,
-    ]);
+    const output = await rt
+      .docker([
+        "run",
+        "-d",
+        "--pull",
+        "never",
+        "--privileged",
+        "--tmpfs",
+        "/dev/shm:size=2g",
+        "--memory",
+        "8192m",
+        "--add-host=host.docker.internal:host-gateway",
+        "-p",
+        "127.0.0.1::10001",
+        "-p",
+        "127.0.0.1::9222",
+        "-e",
+        "ENABLE_WEBRTC=false",
+        "-e",
+        `TZ=${tz}`,
+        ...Object.entries(labels).flatMap(([key, value]) => [
+          "--label",
+          `${key}=${value}`,
+        ]),
+        image,
+      ])
+      .catch(async (error) => {
+        // A failed start leaves the container in Created, which `docker ps`
+        // (and so the cap and the reaper) never lists.
+        const leftover = await rt
+          .docker(["ps", "-aq", "--filter", `label=kernel.local.id=${id}`])
+          .then((ids) => ids.split("\n").filter(Boolean))
+          .catch(() => []);
+        if (leftover.length) {
+          await rt
+            .docker(["rm", "-f", ...leftover])
+            .catch((rmError) =>
+              console.error(
+                "Failed to remove local browser container",
+                rmError,
+              ),
+            );
+        }
+        throw error;
+      });
     return output.trim();
   });
 
@@ -371,19 +401,86 @@ export async function updateBrowser(
   return toBrowser(rt, container);
 }
 
-export async function removeBrowser(
-  rt: LocalRuntime,
-  container: LocalContainer,
-) {
-  if (container.labels.save_profile === "true") {
-    // A failed save keeps the container so the profile data is not lost.
-    await saveProfile(container).catch((error) => {
-      throw new Error(`profile save failed, browser kept: ${error.message}`);
-    });
+// A delete and the reaper can pick the same browser; they share one removal
+// so neither saves twice or reports the other's `docker rm` as a failure.
+export function removeBrowser(rt: LocalRuntime, container: LocalContainer) {
+  const id = container.labels.id;
+  const removing = (rt.removing ??= new Map<string, Promise<void>>());
+  let removal = removing.get(id);
+  if (!removal) {
+    removal = (async () => {
+      if (container.labels.save_profile === "true") {
+        // A failed save keeps the container so the profile data is not lost.
+        await saveProfile(container).catch((error) => {
+          throw new Error(
+            `profile save failed, browser kept: ${error.message}`,
+          );
+        });
+      }
+      await rt.docker(["rm", "-f", container.containerId]);
+      rt.activity.delete(id);
+      rt.viewports.delete(id);
+    })().finally(() => removing.delete(id));
+    removing.set(id, removal);
   }
-  await rt.docker(["rm", "-f", container.containerId]);
-  rt.activity.delete(container.labels.id);
-  rt.viewports.delete(container.labels.id);
+  return removal;
+}
+
+// Wraps a call on a browser: the reaper skips the browser until the call,
+// including a streamed response body, is done. Idle time restarts then.
+export async function trackCall<T extends Response | null>(
+  rt: LocalRuntime,
+  id: string,
+  call: Promise<T>,
+): Promise<T> {
+  const busy = (rt.busy ??= new Map<string, number>());
+  busy.set(id, (busy.get(id) ?? 0) + 1);
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    const left = busy.get(id)! - 1;
+    if (left) busy.set(id, left);
+    else busy.delete(id);
+    // A delete during the call already dropped the id.
+    if (rt.activity.has(id)) rt.activity.set(id, rt.now());
+  };
+  let response: T;
+  try {
+    response = await call;
+  } catch (error) {
+    finish();
+    throw error;
+  }
+  if (!response?.body) {
+    finish();
+    return response;
+  }
+  // Not a TransformStream: Bun never calls its cancel hook.
+  const reader = response.body.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          finish();
+          controller.close();
+        } else controller.enqueue(chunk.value);
+      } catch (error) {
+        finish();
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      finish();
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  }) as T;
 }
 
 // Runs at the start of each local request and every 60 s. Concurrent calls
@@ -394,6 +491,7 @@ export function reapIdle(rt: LocalRuntime) {
       const now = rt.now();
       for (const container of await listContainers(rt.docker)) {
         const id = container.labels.id;
+        if (rt.busy?.get(id)) continue;
         if (!rt.activity.has(id)) rt.activity.set(id, now);
         const idleMs = now - rt.activity.get(id)!;
         if (idleMs < Number(container.labels.timeout) * 1000) continue;
