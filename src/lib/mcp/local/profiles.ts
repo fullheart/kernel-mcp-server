@@ -116,17 +116,19 @@ async function assertNameFree(name: string, exceptId?: string) {
   }
 }
 
-export async function createProfile(name?: string) {
-  if (name) await assertNameFree(name);
-  const now = new Date().toISOString();
-  const profile: Profile = {
-    id: randomBytes(12).toString("hex"),
-    name: name ?? null,
-    created_at: now,
-    updated_at: now,
-  };
-  await writeProfile(profile);
-  return profile;
+export function createProfile(name?: string) {
+  return serialized(async () => {
+    if (name) await assertNameFree(name);
+    const now = new Date().toISOString();
+    const profile: Profile = {
+      id: randomBytes(12).toString("hex"),
+      name: name ?? null,
+      created_at: now,
+      updated_at: now,
+    };
+    await writeProfile(profile);
+    return profile;
+  });
 }
 
 export async function renameProfile(idOrName: string, name: unknown) {

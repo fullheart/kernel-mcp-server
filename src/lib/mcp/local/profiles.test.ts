@@ -116,3 +116,14 @@ test("a save fails before the download when chromium did not stop", async () => 
   expect(downloads).toBe(0);
   expect(await readdir(dir)).toEqual([`${profile.id}.json`]);
 });
+
+test("parallel creates and renames cannot share a name", async () => {
+  const other = await createProfile("other");
+  const results = await Promise.allSettled([
+    createProfile("Shop"),
+    createProfile("shop"),
+    renameProfile(other.id, "SHOP"),
+  ]);
+  expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+  expect(await listProfiles({ name: "shop" })).toHaveLength(1);
+});
