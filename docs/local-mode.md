@@ -1,150 +1,158 @@
 # Local mode spec
 
-Run this MCP server against self-hosted [kernel-images](https://github.com/kernel/kernel-images) containers on the same host. No Kernel cloud account, no Clerk, no Redis. Cloud mode keeps working unchanged. `KERNEL_MODE=local` switches local mode on.
+Run this MCP server against self-hosted [kernel-images](https://github.com/kernel/kernel-images) containers on the same Linux host. No Kernel cloud account, no Clerk, no Redis. Cloud mode keeps working unchanged. `KERNEL_MODE=local` switches local mode on.
 
 Goal: a coding agent (T3 Code, Claude Code, Cursor) tests web apps in a real browser through this server, the kernel.sh use case, fully offline and without the T3 Code built-in browser. Keep it straightforward. Every feature that needs explaining or behaves differently from the cloud costs more than it brings.
 
-Status: spec, not implemented. Branch `feat/local-mode`.
+Status: spec v2, not implemented. Branch `feat/local-mode`. v2 replaces guesses from v1 with facts verified against kernel-images source, the `@onkernel/sdk` 0.121.0 source, the kernel.sh docs and probes against `onkernel/chromium-headful:c1128b7`. Evidence lives in `.cache/facts/` (gitignored, local only).
 
-## Why this needs more than a base URL
+## How kernel-images works (verified)
 
-kernel-images runs one browser per container. Each container exposes:
-
-- `:10001` REST API (process, fs, computer, playwright, repl, webmcp, recording, chromium flags). No auth.
-- `:9222` CDP
-- `:443` live view (noVNC when `ENABLE_WEBRTC=false`)
-
-The Kernel SDK calls the same per-browser endpoints with a `/browsers/{id}` prefix, for example `/browsers/{id}/process/exec` maps to `/process/exec`. Everything above a single browser (create, list, delete, profiles, proxies, pools, vaults, auth connections, apps, projects) lives only in the cloud control plane. Local mode fakes the small part of that control plane we need.
+- One browser per container. The published image `onkernel/chromium-headful:<sha7>` on Docker Hub already contains the API. No build step, no `WITH_KERNEL_IMAGES_API` (nothing reads it).
+- `:10001` REST API, no auth. `:9222` CDP proxy. `/json/version` rewrites the WebSocket host from the request `Host` header, and any WebSocket path reaches the browser target.
+- Ready about 3 to 4 s after `docker run`. `:10001` only starts listening once Chromium is up, so any 2xx from `GET /spec.yaml` means ready.
+- Needs `--privileged` (Chromium sandbox) and `--tmpfs /dev/shm:size=2g`. Idle Chromium uses about 435 MiB.
+- No noVNC. Without `ENABLE_WEBRTC=true` there is no live view at all. WebRTC needs neko plus UDP ports.
+- `WIDTH`/`HEIGHT` env vars do nothing. The screen boots at 3840x2160. `POST /configure` (multipart) sets display, Chromium flags, policies, a profile archive, extensions and `start_url` with one Chromium restart (about 4 s). Display sizes must be modes listed in the image's xorg.conf, at a listed refresh rate.
+- The Kernel SDK calls the same per-browser endpoints with a `/browsers/{id}` prefix. 45 of 52 per-browser paths match after stripping the prefix. The rest: replays (`/recording/*` with other shapes), `GET telemetry/events` (kernel-images only has POST), `curl` (no route), `extensions` (other path and multipart names).
+- Inside the container `localhost` is the container. With `--add-host=host.docker.internal:host-gateway`, the browser reaches a host app at `http://host.docker.internal:<port>` if the app listens on `0.0.0.0`.
+- Chromium is stopped with SIGKILL. A profile saved after a plain stop loses recent cookies and localStorage. CDP `Browser.close` first keeps them.
 
 ## Decisions
 
-| #   | Decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Scope: everything kernel-images can back. No SSO or OAuth. Personal use first.                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| 2   | The MCP server starts one kernel-images container per `browsers.create` through the Docker CLI. `delete` runs `docker rm -f`. Parallel sessions work like in the cloud.                                                                                                                                                                                                                                                                                                                                    |
-| 3   | Transport stays HTTP `/mcp`. Clerk and Redis are bypassed in local mode.                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| 4   | Local mode sits next to cloud mode behind `KERNEL_MODE=local`. Keep the diff small and isolated so upstream rebases stay cheap. Do not delete cloud code.                                                                                                                                                                                                                                                                                                                                                  |
-| 5   | MCP server and browsers run on this host via Docker, image `chromium-headful`. No Unikraft. A shared server for several developers may come later.                                                                                                                                                                                                                                                                                                                                                         |
-| 6   | Adapter: a custom `fetch` passed to `new Kernel({ fetch })` in `src/lib/mcp/kernel-client.ts`. Tool code stays untouched so upstream descriptions and steering text survive.                                                                                                                                                                                                                                                                                                                               |
-| 7   | Cloud-only toolsets are not registered in local mode (default toolset list, see below).                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| 8   | As much as possible, nothing invented. Candidates in priority order: profiles, replays, browser_curl, extensions, proxies. Build a candidate only if its cloud behavior is pinned down by the `@onkernel/sdk` types plus kernel.sh docs and kernel-images can do the same thing. Otherwise drop it and list why in this file. Simplicity beats coverage. Always skip: browser_pools, apps, projects, api_keys, config_registry, auth_connections, credentials, credential_providers, vaults, search, docs. |
-| 9   | Browser state lives in Docker labels on the container. Profiles, proxies and extensions live as files under `KERNEL_LOCAL_DATA_DIR`. No database.                                                                                                                                                                                                                                                                                                                                                          |
-| 10  | Auth: `LOCAL_MCP_TOKENS=alice:tok1,bob:tok2`. The bearer token picks the owner. Containers carry an owner label. list, get and delete only see the caller's browsers. Real isolation (network, quotas per developer) waits for the shared server.                                                                                                                                                                                                                                                          |
-| 11  | Live view via noVNC (`ENABLE_WEBRTC=false`), no UDP port ranges. Containers bind to `127.0.0.1` on random ports. URLs handed to the agent use `KERNEL_LOCAL_PUBLIC_HOST` (default `localhost`). Remote access goes through an SSH tunnel for now.                                                                                                                                                                                                                                                          |
-| 12  | Honor `timeout_seconds`. A reaper removes expired containers on each request and every 60s. `KERNEL_LOCAL_MAX_BROWSERS` caps concurrency (default 5, each Chromium takes 1 to 2 GB RAM).                                                                                                                                                                                                                                                                                                                   |
-| 13  | `make local-image` clones kernel-images into `.cache/kernel-images` and builds `chromium-headful` with the kernel-images API. `KERNEL_LOCAL_IMAGE` overrides the tag. No submodule.                                                                                                                                                                                                                                                                                                                        |
-| 14  | Done means: unit tests for the fetch adapter, a green smoke script against the real server, this doc updated into a how-to, `.env.local-mode.example`.                                                                                                                                                                                                                                                                                                                                                     |
-| 15  | Work on `feat/local-mode`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| #   | Decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Scope: everything kernel-images can back with the same behavior as the cloud. No SSO or OAuth. Personal use first.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 2   | The MCP server starts one container per `browsers.create` through the Docker CLI (`execFile`, no shell). `deleteByID` removes it. Parallel sessions work.                                                                                                                                                                                                                                                                                                                                                                                 |
+| 3   | Transport stays HTTP `/mcp`. Clerk and Redis are bypassed in local mode.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 4   | Local mode sits next to cloud mode behind `KERNEL_MODE=local`. Keep the diff small and isolated so upstream rebases stay cheap. Do not delete cloud code.                                                                                                                                                                                                                                                                                                                                                                                 |
+| 5   | Linux x86_64 host with Docker. MCP server and browsers on the same host. No Unikraft, no macOS.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 6   | Adapter: a custom `fetch` passed to `new Kernel({ fetch })` in `src/lib/mcp/kernel-client.ts`. Tool code stays untouched, with one exception (decision 17).                                                                                                                                                                                                                                                                                                                                                                               |
+| 7   | In local mode the default toolset list is the local one, so no `KERNEL_MCP_ENABLED_TOOLSETS` is needed. An explicit env value still wins.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 8   | Built: browsers, shell, computer, browser_files, playwright, repl, webmcp, replays (start/stop/list), profiles. Dropped because kernel-images cannot match the cloud behavior: browser_curl (cloud curl runs in Chrome's network stack with the profile cookie jar), proxies (no proxy auth, no hot swap, host-side check lies), extensions (no upload tool, activation unverified). Always skipped: browser_pools, apps, projects, api_keys, config_registry, auth_connections, credentials, credential_providers, vaults, search, docs. |
+| 9   | Create-time browser facts live in Docker labels. Mutable state (viewport after update, last activity) lives in an in-memory map. After an MCP restart the viewport falls back to the label and idle time starts fresh. Profiles live as files under `KERNEL_LOCAL_DATA_DIR`. No database.                                                                                                                                                                                                                                                 |
+| 10  | Auth: `LOCAL_MCP_TOKENS=alice:tok1,bob:tok2`. The bearer token picks the owner. Containers carry an owner label. Every browser operation (list, get, update, delete, every forwarded `/browsers/{id}/*` call, replays) only sees the caller's browsers; others get 404. Profiles are shared by all tokens.                                                                                                                                                                                                                                |
+| 11  | No live view. `browser_live_view_url` is omitted. Containers publish 10001 and 9222 on `127.0.0.1` with random host ports. `cdp_ws_url` is `ws://${KERNEL_LOCAL_PUBLIC_HOST}:<port>/` (default host `localhost`).                                                                                                                                                                                                                                                                                                                         |
+| 12  | `timeout_seconds` is an idle timeout, as in the cloud (default 60, min 10, max 259200). Activity = any adapter call for that browser. A reaper removes idle containers at the start of each local request and every 60 s (one interval per process, guarded on `globalThis` for HMR). `KERNEL_LOCAL_MAX_BROWSERS` (default 5) caps running containers across all owners. Direct CDP traffic to `cdp_ws_url` bypasses the adapter and does not count.                                                                                      |
+| 13  | Image: `KERNEL_LOCAL_IMAGE`, default `onkernel/chromium-headful:c1128b7`. The user pulls it once (`docker pull`). `docker run --pull never` fails fast instead of pulling 2.7 GB inside an SDK request. No Makefile, no source build.                                                                                                                                                                                                                                                                                                     |
+| 14  | Done means: unit tests for the adapter, route tests for local auth, a green smoke script against a real server and real containers, this doc rewritten into a how-to, `.env.local-mode.example`.                                                                                                                                                                                                                                                                                                                                          |
+| 15  | Work on `feat/local-mode`, draft PR against `main` of `fullheart/kernel-mcp-server`.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 16  | The browser reaches host apps through `host.docker.internal` (`--add-host=host.docker.internal:host-gateway` on every container). Documented, including the `0.0.0.0` bind requirement.                                                                                                                                                                                                                                                                                                                                                   |
+| 17  | `manage_profiles setup` normally tells the user to open the live view. In local mode, when `browser_live_view_url` is missing, it instead tells the agent to sign in with `execute_playwright_code` or `computer_action` and then delete the browser to save the profile. This is the only tool text change.                                                                                                                                                                                                                              |
 
 ## Environment
 
 ```bash
 KERNEL_MODE=local
-LOCAL_MCP_TOKENS=me:change-me            # name:token pairs, comma separated
-KERNEL_LOCAL_IMAGE=kernel-images/chromium-headful:local
-KERNEL_LOCAL_DATA_DIR=./.local-data      # profiles/, proxies.json, extensions/
+LOCAL_MCP_TOKENS=me:change-me            # name:token pairs, comma separated. Tokens must not look like a JWT (no two dots)
+KERNEL_LOCAL_IMAGE=onkernel/chromium-headful:c1128b7
+KERNEL_LOCAL_DATA_DIR=./.local-data      # profiles/
 KERNEL_LOCAL_PUBLIC_HOST=localhost
 KERNEL_LOCAL_MAX_BROWSERS=5
-KERNEL_MCP_ENABLED_TOOLSETS=browsers,shell,computer,browser_files,playwright,repl,webmcp,replays,browser_curl,profiles,proxies,extensions
-CLERK_SECRET_KEY=local-dummy             # only used as an HMAC secret
 ```
+
+`KERNEL_PROJECT` must stay unset (or `local`). Anything that cloud mode needs at import time (`CLERK_SECRET_KEY` for HMAC, Clerk publishable key in `src/proxy.ts`) must either get a local fallback or be skipped in local mode, so the env block above is all a user sets. Verify with `next dev` and `next start`.
 
 ## Request flow in local mode
 
-`src/app/[transport]/route.ts`, `handleAuthenticatedRequest` and `handleMcpRequestWithIdentity`:
-
-1. Match the bearer token against `LOCAL_MCP_TOKENS`. Unknown token returns 401. No Clerk `verifyToken`.
-2. Skip `resolveMcpConnectionContext` (`auth.context.retrieve`). Return a synthetic context: org `local`, project `local`, user = token owner.
-3. Skip `resolveMcpEntitlements` and force all entitlements off, so vault and search tools stay hidden.
-4. Skip the Redis MCP Apps marker store (treat as "no MCP Apps").
-5. Pass the token owner to `createKernelClient` so the fetch adapter can scope by owner.
-
-OAuth routes (`/authorize`, `/token`, `/register`, `/.well-known/*`, `/select-org`, `/oauth/*`) and `managed-auth-proxy` stay in the code but are unused. Check that the app boots in local mode without `REDIS_URL` and without real Clerk keys. If a module throws at import time, guard it with `KERNEL_MODE`.
+1. `src/proxy.ts`: skip `clerkMiddleware` in local mode. It throws without a publishable key under `next start` and in CI.
+2. `src/app/[transport]/route.ts`: in local mode never call Clerk `verifyToken`. Treat every bearer as a local token. Use a local HMAC secret fallback where `CLERK_SECRET_KEY` is required (transport session signing, MCP Apps auth subject). Use a no-op MCP Apps marker store (`src/lib/mcp-apps-request.ts` already takes a store parameter).
+3. The fetch adapter answers `GET /auth/context` with a schema-valid context (`src/lib/mcp/auth-context.ts:10-27`) where org, project and user are `local` / the token owner, so `resolveMcpConnectionContext` yields `{kind: "project", projectId: "local"}`. Unknown token: 401 `{"message": "invalid local token"}`, which route.ts turns into 401 `invalid_token`.
+4. `GET /org/entitlements` returns `{"features": {}}`, which hides vault and search tools.
+5. OAuth routes stay in the code but are unused.
 
 ## Fetch adapter
 
-New module `src/lib/mcp/local/` (keep it to a few files). `createKernelClient` passes `fetch: localKernelFetch(owner)` and a dummy `baseURL` when `KERNEL_MODE=local`.
+Module `src/lib/mcp/local/`, a few files. `createKernelClient` passes `fetch: localKernelFetch` and baseURL `http://kernel.local` when `KERNEL_MODE=local`. The owner comes from the `Authorization: Bearer` header of each request, so no call site changes.
+
+SDK contract (verified in SDK source):
+
+- Synthetic JSON responses must send `content-type: application/json`, or the SDK returns a string.
+- Never put `base_url` or a `jwt` into a browser object. The SDK would route per-browser calls to that URL and bypass the adapter.
+- Every adapter-generated error sets `x-should-retry: false`. The SDK retries any 5xx twice otherwise.
+- List endpoints return a bare JSON array with no pagination headers (one page).
+- Decode the path id with `decodeURIComponent`.
+- Honor `init.signal`: if a create is aborted after `docker run`, remove the container.
 
 Routing:
 
-| SDK request                               | Local handler                                                                                                                                                                                    |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `POST /browsers`                          | Enforce max browsers, `docker run` (see below), wait for `:10001` health, return a cloud-shaped browser object                                                                                   |
-| `GET /browsers`, `GET /browsers/{id}`     | `docker ps --filter label=kernel.local.owner=<owner>`, map labels to the cloud shape (`session_id`, `cdp_ws_url`, `browser_live_view_url`, viewport, `profile`, `timeout_seconds`, `created_at`) |
-| `DELETE /browsers/{id}`                   | Optional profile save (see profiles), then `docker rm -f`                                                                                                                                        |
-| `PATCH /browsers/{id}`                    | Map viewport to `/display`, flags to `/chromium/flags`. Return 400 for fields we can't map                                                                                                       |
-| `/browsers/{id}/replays*`                 | Map to `/recording/start`, `/recording/stop`, `/recording/list`, `/recording/download`. Translate response shapes                                                                                |
-| `POST /browsers/{id}/curl`                | Run `curl` through `/process/exec` inside the container, return the cloud response shape                                                                                                         |
-| `/browsers/{id}/<anything else>`          | Strip `/browsers/{id}`, forward to `http://127.0.0.1:<api port>/<rest>` with method, headers, body and streaming intact                                                                          |
-| `/profiles*`, `/proxies*`, `/extensions*` | Local handlers backed by `KERNEL_LOCAL_DATA_DIR`                                                                                                                                                 |
-| `/auth/context`, `/org/entitlements`      | Synthetic responses (defense in depth, route.ts should already skip them)                                                                                                                        |
-| anything else                             | 501 with `{"message": "not available in local mode"}`                                                                                                                                            |
-
-Use the SDK's own response types from `@onkernel/sdk` for the cloud shapes, so `tsc` catches drift after an SDK bump.
+| SDK request                           | Local handler                                                                                                                                                       |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /browsers`                      | In-process lock, enforce max browsers, reject unsupported params, `docker run`, wait for ready, `POST /configure`, return the browser object                        |
+| `GET /browsers`                       | `docker ps` with `label=kernel.local.owner=<owner>`, map to browser objects                                                                                         |
+| `GET /browsers/{id}`                  | Same, by id or name                                                                                                                                                 |
+| `PATCH /browsers/{id}`                | `viewport` via `PATCH /display` with the resolved refresh rate. Any other field: 400                                                                                |
+| `DELETE /browsers/{id}`               | Save profile if `save_changes`, then `docker rm -f`                                                                                                                 |
+| `GET /browsers/{id}/telemetry/events` | `[]`                                                                                                                                                                |
+| `/browsers/{id}/replays*`             | Map to `/recording/*` (below)                                                                                                                                       |
+| `/browsers/{id}/<rest>`               | Owner check, touch activity, strip prefix, forward to `http://127.0.0.1:<api port>/<rest>` with method, query, headers and body. Stream the response back unchanged |
+| `/profiles*`                          | Local profile store (below)                                                                                                                                         |
+| `/auth/context`, `/org/entitlements`  | Synthetic, see request flow                                                                                                                                         |
+| anything else                         | 501 `{"message": "<method> <path> is not available in local mode"}`                                                                                                 |
 
 ### docker run
 
-Follow `images/chromium-headful/run-docker.sh` in kernel-images:
+```
+docker run -d --pull never --privileged --tmpfs /dev/shm:size=2g --memory 8192m
+  --add-host=host.docker.internal:host-gateway
+  -p 127.0.0.1::10001 -p 127.0.0.1::9222
+  -e ENABLE_WEBRTC=false -e TZ=<host TZ>
+  --label kernel.local=1 --label kernel.local.id=<id> --label kernel.local.owner=<owner>
+  --label kernel.local.name=<name> --label kernel.local.timeout=<seconds>
+  --label kernel.local.created=<iso> --label kernel.local.viewport=<WxH@R> --label kernel.local.kiosk=<bool>
+  --label kernel.local.profile=<profile id> --label kernel.local.save_profile=<bool>
+  <KERNEL_LOCAL_IMAGE>
+```
 
-- `--privileged --tmpfs /dev/shm:size=2g --memory 8192m`
-- publish `127.0.0.1::10001`, `127.0.0.1::9222`, `127.0.0.1::443` (random host ports, read back with `docker port`)
-- `-e ENABLE_WEBRTC=false -e WIDTH -e HEIGHT -e TZ`
-- write a flags file `{"flags":[...]}` per container and bind-mount it to `/chromium/flags`. Start from the default flags in `run-docker.sh` (`--user-data-dir=/home/kernel/user-data ...`), add `--proxy-server` for proxies and the requested extensions
-- labels: `kernel.local=1`, `kernel.local.id`, `kernel.local.owner`, `kernel.local.expires`, `kernel.local.profile`, `kernel.local.save_profile`, `kernel.local.proxy`
-- `stealth`, `headless`, `kiosk_mode`: map what kernel-images supports, ignore the rest and say so in the returned object or a warning log
+Read the host ports back with `docker port`. After ready, `POST /configure` with:
 
-Call Docker with `execFile("docker", [...])` from `node:child_process`. No new dependency, no shell string building.
+- `display`: the requested viewport, else the cloud default 1920x1080@25. When `refresh_rate` is omitted, use the highest rate xorg.conf lists for that size. Sizes not listed: 400 with the list of supported sizes. Read the mode list from the image's xorg.conf via `/fs/read_file` (path from the facts), cached per image.
+- `chromium_flags`: `--kiosk` when `kiosk_mode`.
+- `profile_archive`: the stored archive when a profile with data is requested.
+- `start_url` when given.
+
+If anything after `docker run` fails, remove the container and return the error.
+
+### Browser object
+
+Fields: `session_id`, `name`, `created_at`, `timeout_seconds`, `cdp_ws_url`, `viewport {width, height, refresh_rate}`, `kiosk_mode`, `headless: false`, `stealth: false`, `profile {id, name}` when used. Omit fields with no local meaning: `browser_live_view_url`, `base_url`, `webdriver_ws_url`, `region`, `memory`, `telemetry`, `pool`, `proxy_id`. Type it from the SDK types with `Omit`/`Pick` so `tsc` catches drift.
+
+### Create params
+
+- No local effect, accepted and reflected truthfully in the response: `stealth` (always false), `headless` (always false), `gpu`, `region`, `memory`, `telemetry`, `invocation_id`.
+- Need cloud resources, 400 with a clear message: `proxy_id`, `extensions`, `vaults`, `pool`, `network`.
+- `name` must be unique per owner (409).
+
+### Replays
+
+- `start`: generate a UUID, `POST /recording/start {"id": uuid}` (plus mapped options), return `{replay_id}`.
+- `stop`: `POST /recording/stop {"id"}`, return 204.
+- `list`: `GET /recording/list`, map `{id, started_at, finished_at}` to `{replay_id, started_at, finished_at}`.
+- No `replay_view_url`. Recordings live in the container under `/recordings/<id>.mp4` and disappear with it. Document that `manage_browser_files` can read the file while the browser exists.
 
 ### Profiles
 
-- Store at `$KERNEL_LOCAL_DATA_DIR/profiles/<name>/`
-- Create with a profile: copy the profile dir to a per-container work dir and bind-mount that to `/home/kernel/user-data`. The original stays untouched until a save. Match the cloud `save_changes` semantics from the SDK types and docs
-- `save_changes: true`: on delete, copy the user-data dir back into the profile dir. Chromium must be stopped or the copy is corrupt. Stop the container first, then copy, then remove
-- `profiles.list/retrieve/create/delete/update` work on the directory
+Store under `$KERNEL_LOCAL_DATA_DIR/profiles/`: `<id>.json` (`{id, name, created_at, updated_at, last_used_at}`) and `<id>.tar.zst` once saved. Ids are 24 random lowercase hex chars. Names are unique, matched case-insensitively (409 on duplicate). `create`, `list`, `retrieve` (id or name), `update` (rename), `delete` follow the SDK shapes.
 
-### Proxies
-
-Lowest priority. Cloud proxy types other than `custom` (datacenter, ISP, residential, mobile) are Kernel-managed and cannot exist locally. If built, support only `custom`.
-
-- `$KERNEL_LOCAL_DATA_DIR/proxies.json`, CRUD through the proxies API shape
-- Applied at browser create as `--proxy-server`. Proxy auth via an extension or Chromium policy if kernel-images supports it. Otherwise only unauthenticated proxies, documented
-- `proxies.check`: run `curl -x` from the host
-
-### Extensions
-
-- `$KERNEL_LOCAL_DATA_DIR/extensions/<name>/`
-- list and delete work on the directory. At create time upload through `/chromium/upload-extensions-and-restart` or load via flags, whichever kernel-images supports cleanly
-
-### Reaper
-
-Runs at the start of each local request (cheap `docker ps` with label filter) and on a 60s `setInterval` started once per process. Removes containers whose `kernel.local.expires` is in the past. Saves the profile first when `save_profile` is set.
-
-## Image build
-
-`Makefile` target `local-image`:
-
-```make
-local-image:
-	test -d .cache/kernel-images || git clone --depth 1 https://github.com/kernel/kernel-images .cache/kernel-images
-	cd .cache/kernel-images/images/chromium-headful && IMAGE=$${KERNEL_LOCAL_IMAGE:-kernel-images/chromium-headful:local} ./build-docker.sh
-```
-
-Add `.cache/` and `.local-data/` to `.gitignore`. Check whether the image needs `WITH_KERNEL_IMAGES_API=true` at build or run time and wire it in.
+- Load: `POST /configure` with `profile_archive` = the `.tar.zst` file. A profile without an archive starts empty.
+- Save (delete or idle reap with `save_changes`): CDP `Browser.close` on `ws://127.0.0.1:<cdp port>/` (Node 24 global `WebSocket`), then `/process/exec` `supervisorctl -c /etc/supervisor/supervisord.conf stop chromium`, then `GET /fs/download_dir_zstd?path=/home/kernel/user-data`, written atomically (temp file plus rename). Then remove the container.
+- Last writer wins, no locking, same as the cloud.
 
 ## Tests and acceptance
 
-1. `bun test` unit tests for the fetch adapter with a fake Docker runner (inject `execFile`): path rewrite, create, list scoped by owner, delete, max browsers, expiry, replays mapping, curl mapping, 501 fallback.
-2. `bun test` for the local branch in `route.ts`: valid token, unknown token 401, no Clerk call, no Redis call.
-3. `scripts/local-smoke.sh` against `bun run dev` with `KERNEL_MODE=local` and the built image, using curl JSON-RPC as in AGENTS.md:
-   - `initialize`, `tools/list` contains only local toolsets
-   - `manage_browsers` create with profile `smoke` and `save_changes`
-   - `execute_playwright_code`: `goto https://example.com`, set a cookie or localStorage value
+1. `bun test` unit tests for the adapter, with an injected Docker runner and a fake container API: prefix strip and pass-through, create (lock, max browsers, unsupported params, configure body, cleanup on failure and abort), list and get scoped by owner, delete with and without profile save, update viewport, idle reap, replays mapping, telemetry, profiles CRUD, auth context, entitlements, 501 fallback with `x-should-retry: false`. Follow the `new Kernel({ fetch })` pattern in `src/lib/mcp/vaults.test-fixtures.ts`.
+2. `bun test` for the local branch in `route.ts` and `src/proxy.ts`: valid token, unknown token 401, no Clerk call, no Redis call.
+3. `scripts/local-smoke.sh` against `next dev` with `KERNEL_MODE=local` and the real image, curl JSON-RPC as in AGENTS.md:
+   - `initialize`, `tools/list` has exactly the local tools plus the always-on ones (`get_connection_context`, `get_more_tools`, `submit_feedback`)
+   - `manage_profiles setup` or `manage_browsers` create with profile `smoke` and `save_changes`
+   - `execute_playwright_code`: open a page served by a tiny host server on `0.0.0.0` via `host.docker.internal`, set a cookie and a localStorage value
    - `computer_action` screenshot returns an image
    - `exec_command` `ls /` works
-   - delete, create again with profile `smoke`, the value is still there
+   - delete, create again with profile `smoke`, both values are still there
    - delete, `docker ps --filter label=kernel.local` is empty
-4. `bun run format:check` and `bunx tsc --noEmit` pass. Existing tests stay green in cloud mode.
-5. This file becomes a how-to (setup, env, MCP client config for Claude Code and Cursor, SSH tunnel for live view, limits).
+   - never more than 2 containers at once (host disk is tight)
+4. `bunx tsc --noEmit` passes. Existing tests stay green. `bun run format:check` passes for changed files (`AGENTS.md` already fails on `main`, leave it).
+5. This file becomes a how-to: setup, env, MCP client config for Claude Code, Codex and Cursor, reaching host apps, limits, what is not supported and why.
 
 ## Review loop
 
@@ -155,12 +163,12 @@ After implementation, loop at most 4 rounds until no valid Critical or Major fin
 3. Check each finding against the current code. Fix valid ones in parallel subagents, never two agents on one file. Reject invalid ones with a one-line reason
 4. One commit per fix
 
-List leftovers in the PR description.
+List leftovers in the PR description and post a summary of the review rounds as a PR comment.
 
 ## Out of scope
 
+- Live view (WebRTC/neko spike, maybe later for the shared server)
+- browser_curl, proxies, extensions (see decision 8)
 - Browser pools, apps, deployments, invocations, projects, API keys, config registry, managed auth, credentials, vaults, wallets, cards, web search, docs search
-- WebRTC live view, reverse proxy, TLS
-- Per-developer network or resource isolation
-- Unikraft
-- macOS, Docker Desktop, arm64. Linux x86_64 host only
+- Reverse proxy, TLS, per-developer network or resource isolation
+- Unikraft, macOS, Docker Desktop, arm64
