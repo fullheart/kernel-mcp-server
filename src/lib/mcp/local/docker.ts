@@ -51,7 +51,7 @@ export type LocalContainer = {
 
 // Labels are read one by one: `docker ps` joins all labels into one string
 // that cannot be split safely when a browser name contains a comma.
-const PS_FORMAT = `{"containerId":{{json .ID}},"image":{{json .Image}},"ports":{{json .Ports}}${LABELS.map(
+const PS_FORMAT = `{"containerId":{{json .ID}},"image":{{json .Image}},"state":{{json .State}},"ports":{{json .Ports}}${LABELS.map(
   (label) => `,"${label}":{{json (.Label "kernel.local.${label}")}}`,
 ).join("")}}`;
 
@@ -63,18 +63,39 @@ export async function listContainers(
     "--filter",
     `label=${label}`,
   ]);
-  const output = await docker([
-    "ps",
-    "--no-trunc",
-    ...filters,
-    "--format",
-    PS_FORMAT,
-  ]);
-  return output
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      const row = JSON.parse(line);
+  const list = async () => {
+    const output = await docker([
+      "ps",
+      "-a",
+      "--no-trunc",
+      ...filters,
+      "--format",
+      PS_FORMAT,
+    ]);
+    return output
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  };
+  let rows = await list();
+  // A Docker or host restart leaves browsers exited. Starting them again
+  // makes them behave like browsers of a restarted server: the reaper saves
+  // and removes them after their timeout.
+  // ponytail: a container that dies on every start is started again on every
+  // call. Remember failed ids if that ever happens.
+  const exited = rows.filter((row) => row.state === "exited");
+  if (exited.length) {
+    await docker(["start", ...exited.map((row) => row.containerId)]).catch(
+      (error) => console.error("Failed to start stopped local browsers", error),
+    );
+    rows = await list();
+  }
+  // Created containers may belong to a `docker run` that is still starting.
+  return rows
+    .filter(
+      (row) => !["created", "exited", "dead", "removing"].includes(row.state),
+    )
+    .map((row) => {
       const port = (inner: number) =>
         Number(row.ports.match(new RegExp(`:(\\d+)->${inner}/tcp`))?.[1]);
       return {
