@@ -203,7 +203,10 @@ export function registerProfileCapabilities(
 
             return textResponse(
               `profile "${params.profile_name}" ${isNewProfile ? "created" : "loaded for update"}.\n\n` +
-                `**setup:** open ${browser.browser_live_view_url} and sign into accounts to save.\n` +
+                // Local mode browsers have no live view, so the agent signs in itself.
+                (browser.browser_live_view_url
+                  ? `**setup:** open ${browser.browser_live_view_url} and sign into accounts to save.\n`
+                  : `**setup:** profile browser ${browser.session_id} is ready with save_changes. there is no live view, so sign into accounts with execute_playwright_code or computer_action.\n`) +
                 `**when done:** use manage_browsers with action "delete" and session_id "${browser.session_id}" to save the profile.\n\n` +
                 `profile id: ${profile.id} | session id: ${browser.session_id}`,
             );
