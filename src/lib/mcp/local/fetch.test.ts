@@ -256,6 +256,18 @@ describe("local auth and fallbacks", () => {
     expect(adapterCalls).toBe(1);
   });
 
+  test("refuses the public placeholder token", async () => {
+    process.env.LOCAL_MCP_TOKENS = "alice:tok-alice, me:change-me";
+    try {
+      const error = await rejection(
+        client("change-me").auth.context.retrieve(),
+      );
+      expect(error.status).toBe(401);
+    } finally {
+      process.env.LOCAL_MCP_TOKENS = "alice:tok-alice, bob:tok-bob";
+    }
+  });
+
   test("answers routes without a local backend with a non-retried 501", async () => {
     const error = await rejection(client().proxies.list());
     expect(error.status).toBe(501);

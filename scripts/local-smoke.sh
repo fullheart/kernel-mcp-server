@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local mode smoke test (docs/local-mode.md, "Tests and acceptance" item 3).
 # Needs a running server with KERNEL_MODE=local and the image pulled, plus curl, python3 and docker.
-#   TOKEN=change-me scripts/local-smoke.sh
+#   TOKEN=<token from .env.local> scripts/local-smoke.sh
 # TOKEN and OWNER default to the first pair of LOCAL_MCP_TOKENS when that is exported.
 set -euo pipefail
 shopt -s inherit_errexit

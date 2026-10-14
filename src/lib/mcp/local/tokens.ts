@@ -3,6 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 const digest = (value: string) => createHash("sha256").update(value).digest();
 
 // LOCAL_MCP_TOKENS="alice:tok1,bob:tok2". The bearer token picks the owner.
+// The placeholder from .env.local-mode.example is public, so it never matches.
 export function ownerForToken(token: string): string | null {
   for (const pair of (process.env.LOCAL_MCP_TOKENS ?? "").split(",")) {
     const separator = pair.indexOf(":");
@@ -12,6 +13,7 @@ export function ownerForToken(token: string): string | null {
       separator > 0 &&
       owner &&
       value &&
+      value !== "change-me" &&
       timingSafeEqual(digest(value), digest(token))
     ) {
       return owner;

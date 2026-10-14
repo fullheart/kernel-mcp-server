@@ -27,7 +27,7 @@ Status: implemented on branch `feat/local-mode`. The first half of this file is 
 cp .env.local-mode.example .env.local
 ```
 
-Replace `change-me` with a long random string, for example the output of `openssl rand -hex 24`. The server accepts `change-me` like any other token. Next.js reads `.env.local` for `dev`, `build` and `start`, so this replaces a cloud `.env.local` if you have one. Local mode needs no 1Password and no `make` targets.
+Replace `change-me` with a long random string, for example the output of `openssl rand -hex 24`. `change-me` is public in this repo, so the server refuses it. Next.js reads `.env.local` for `dev`, `build` and `start`, so this replaces a cloud `.env.local` if you have one. Local mode needs no 1Password and no `make` targets.
 
 | Variable                      | Default                             | Meaning                                                                                                     |
 | ----------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------- |
