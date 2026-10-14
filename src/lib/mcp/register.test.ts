@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { connectTestMcp } from "@/lib/mcp/mcp-test-fixtures";
 import { instrumentMcpAnalytics } from "@/lib/mcp/analytics";
-import { registerMcpCapabilities } from "@/lib/mcp/register";
+import { LOCAL_TOOLSETS } from "@/lib/mcp/local/mode";
+import {
+  mcpToolsetEnabledByConfig,
+  registerMcpCapabilities,
+} from "@/lib/mcp/register";
 import { KERNEL_MCP_TOOL_NAMES } from "@/lib/mcp/tool-names";
 
 const NON_AUTH_TOOLSETS = [
@@ -326,5 +330,86 @@ describe("project selection registration", () => {
       expect(registration.schemas.get(name)).not.toHaveProperty("project");
       expect(registration.schemas.get(name)).not.toHaveProperty("project_id");
     }
+  });
+});
+
+describe("local mode toolsets", () => {
+  async function withEnv<T>(
+    env: Record<string, string | undefined>,
+    run: () => Promise<T> | T,
+  ): Promise<T> {
+    const previous = Object.fromEntries(
+      Object.keys(env).map((key) => [key, process.env[key]]),
+    );
+    const assign = (values: Record<string, string | undefined>) => {
+      for (const [key, value] of Object.entries(values)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+    assign(env);
+    try {
+      return await run();
+    } finally {
+      assign(previous);
+    }
+  }
+
+  test("defaults to the local toolsets when none are configured", async () => {
+    const local = await withEnv(
+      {
+        KERNEL_MODE: "local",
+        KERNEL_MCP_ENABLED_TOOLSETS: undefined,
+        KERNEL_MCP_DISABLED_TOOLSETS: undefined,
+      },
+      () => captureRegistration(false, true, false, true),
+    );
+    const configured = await withEnv(
+      {
+        KERNEL_MODE: undefined,
+        KERNEL_MCP_ENABLED_TOOLSETS: LOCAL_TOOLSETS.join(","),
+        KERNEL_MCP_DISABLED_TOOLSETS: undefined,
+      },
+      () => captureRegistration(false, true, false, true),
+    );
+
+    expect([...local.legacyTools].sort()).toEqual(
+      [...configured.legacyTools].sort(),
+    );
+    expect(local.legacyTools).toContain("manage_browsers");
+    expect(local.legacyTools).not.toContain("manage_vaults");
+    expect(local.legacyTools).not.toContain("search_docs");
+  });
+
+  test("lets an explicit toolset list win", async () => {
+    const registration = await withEnv(
+      {
+        KERNEL_MODE: "local",
+        KERNEL_MCP_ENABLED_TOOLSETS: "docs",
+        KERNEL_MCP_DISABLED_TOOLSETS: undefined,
+      },
+      () => captureRegistration(false),
+    );
+    expect(registration.legacyTools).toEqual([
+      "get_connection_context",
+      "search_docs",
+    ]);
+  });
+
+  test("keeps search off by config in local mode", async () => {
+    const env = {
+      KERNEL_MCP_ENABLED_TOOLSETS: undefined,
+      KERNEL_MCP_DISABLED_TOOLSETS: undefined,
+    };
+    expect(
+      await withEnv({ ...env, KERNEL_MODE: "local" }, () =>
+        mcpToolsetEnabledByConfig("search"),
+      ),
+    ).toBe(false);
+    expect(
+      await withEnv({ ...env, KERNEL_MODE: undefined }, () =>
+        mcpToolsetEnabledByConfig("search"),
+      ),
+    ).toBe(true);
   });
 });
